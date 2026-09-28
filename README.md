@@ -7,6 +7,7 @@
 - 边界抖动去抖：可配置的**进入/离开缓冲距离**（迟滞带）+ **停留时长**（dwell）
 - 产出 `enter` / `leave` / `stay` 事件；**重复提交轨迹点不会重复产出事件**（幂等）
 - **围栏容量核算**：按生效时刻维护正整数容量上限规则，查询任意 `[start, end)` 窗口的占用分段与超限明细
+- **定向门线穿越核算**：围栏内保存简单 GeoJSON LineString 门线（正/反向名称 + 最小位移），只承认相邻轨迹点对门线的**单点横穿**，穿越时刻按交点比例插值
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -31,6 +32,20 @@ docker compose up --build
 3. **停留去抖（dwell）**：状态迁移条件首次满足时开始计时，持续满足 `enter_dwell_s` / `exit_dwell_s` 才确认迁移并产出事件；期间条件被打破则作废。事件时间取**条件首次满足的轨迹时刻**。
 4. **stay**：进入围栏后连续停留达到 `stay_min_s` 产出一次 `stay`（每次访问最多一次）。
 5. **乱序与幂等**：轨迹点按 `(device_id, ts)` 唯一约束去重；每次摄入后按设备全量轨迹（时间升序）重算事件，因此乱序到达与按序到达结果一致，重复提交结果不变。
+
+## 门线穿越判定逻辑
+
+1. **门线几何**：门线是围栏内的简单（不自交、无重复点）GeoJSON `LineString`，**整条线必须位于围栏有效区域内**——不得越出外环（落在外边界上允许），也不得穿入孔洞或贴着孔洞边界。创建时按围栏投影做 `covers` + 孔洞边界相交校验，不满足返回 `422`。
+2. **方向定义**：方向按门线坐标顺序判定。沿坐标顺序看，**右 → 左为正向（forward）**，左 → 右为反向（reverse），查询结果分别以门线的 `forward_name` / `reverse_name` 表示。
+3. **横穿条件**：轨迹按设备时间升序重排，逐对相邻点形成的线段与门线检测，**只承认单点横穿（proper crossing）**——交点同时严格位于两条线段内部，且两端分居门线两侧。以下情况一律忽略：
+   - **沿线**：轨迹线段与门线共线（含重合/部分重叠）；
+   - **仅接触端点**：轨迹止于/始于门线端点，或交点恰好是门线端点或门线折点；
+   - **同侧擦碰**：两端在门线同一侧（即使线段从门线附近经过）；
+   - **位移不足**：相邻点直线位移 `< min_displacement_m`。
+4. **穿越时刻**：取交点在轨迹线段上的长度/参数比例 `t∈(0,1)`，在两端点时间戳间线性插值 `ts = t0 + t·(t1 - t0)`；交点经纬度随结果一并返回。
+5. **多门线排序**：同一轨迹段命中多条门线时，结果按 **(插值时刻, 门线 ID)** 升序排列。
+6. **乱序重算与幂等**：穿越记录与事件一样在每次摄入后按设备全量重算并整体替换；补录乱序点（包括更早的点）后结果自动更新，**不残留旧记录、不产生重复**。新建门线也会对存量轨迹补算。
+7. **与围栏状态机解耦**：穿越是纯几何事件，不受 enter/leave 缓冲迟滞、dwell 与孔洞状态判定影响（例如门线贴在外环上时，围栏外的点横穿门线同样核算）。
 
 ## 示例请求
 
@@ -143,6 +158,72 @@ curl 'http://localhost:8000/fences/1/occupancy?start=2026-09-22T08:00:00Z&end=20
 4. **超限明细**：`exceeded=true` 的分段给出 `limit`（上限）、`count`（实际人数）、`excess`（超额数）与按 ID 排序的 `devices`；其余分段 `excess`/`devices` 为 `null`。
 5. **重算一致**：占用在查询时由事件现算；补录乱序轨迹点触发事件重算后，再次查询即反映最新结果，不残留旧的占用或超限片段。
 
+### 7. 新增定向门线
+
+```bash
+curl -X POST http://localhost:8000/fences/1/gates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[116.305, 39.910], [116.315, 39.910]]
+    },
+    "forward_name": "南向北（入园）",
+    "reverse_name": "北向南（出园）",
+    "min_displacement_m": 5
+  }'
+```
+
+- 门线坐标顺序为 **西 → 东** 时，门线右侧为南、左侧为北：南→北穿入即 `forward`（入园），北→南即 `reverse`（出园）。
+- 整条线越出围栏有效区域、穿过/接触孔洞、非 `LineString`、单点、重复点或自相交，均返回 `422`；围栏不存在返回 `404`。
+- 管理接口：`GET /fences/1/gates`、`DELETE /fences/1/gates/{gate_id}`（删除门线同时清除其穿越记录）。
+
+### 8. 查询门线穿越
+
+提交一段南北往返轨迹后：
+
+```bash
+curl -X POST http://localhost:8000/points -H 'Content-Type: application/json' \
+  -d '{"points": [
+    {"device_id": "dev-001", "ts": "2026-09-22T08:00:00Z", "lat": 39.909, "lon": 116.310},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:00:20Z", "lat": 39.911, "lon": 116.310},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:01:00Z", "lat": 39.909, "lon": 116.310}
+  ]}'
+
+curl 'http://localhost:8000/crossings?device_id=dev-001&start=2026-09-22T08:00:00Z&end=2026-09-22T09:00:00Z'
+```
+
+返回（穿越时刻分别插值到 `08:00:10` 与 `08:00:40`）：
+
+```json
+[
+  {"id": 1, "device_id": "dev-001", "fence_id": 1, "gate_id": 1,
+   "direction": "forward", "direction_name": "南向北（入园）",
+   "ts": "2026-09-22T08:00:10Z", "lat": 39.91, "lon": 116.31},
+  {"id": 2, "device_id": "dev-001", "fence_id": 1, "gate_id": 1,
+   "direction": "reverse", "direction_name": "北向南（出园）",
+   "ts": "2026-09-22T08:00:40Z", "lat": 39.91, "lon": 116.31}
+]
+```
+
+- 查询参数：`device_id`、`gate_id`、`fence_id`、`direction=forward|reverse`、`start`/`end`（半开 `[start,end)`，必须同时给出，否则 `422`）、`limit`、`offset`。
+- 结果固定按 `(ts, gate_id, id)` 升序返回，便于同一轨迹段命中多门线时还原顺序。
+
+### 9. 边界情形示例（均不产生 crossing）
+
+门线取 `LineString [(lon=116.305,lat=39.910), (116.315,39.910)]`（西→东），表中点按 `(纬度, 经度)` 书写：
+
+| 情形 | 轨迹相邻点 | 结果 |
+| --- | --- | --- |
+| 沿线 | `(39.910,116.308)` → `(39.910,116.312)` | 共线，忽略 |
+| 仅接触端点 | `(39.909,116.305)` → `(39.910,116.305)` | 交点是门线端点，忽略 |
+| 跨端点穿过 | `(39.909,116.305)` → `(39.911,116.305)` | 交点仍在门线端点，忽略 |
+| 同侧擦碰 | `(39.909,116.308)` → `(39.909,116.312)` | 两端同在南侧，忽略 |
+| 端点落在线上 | `(39.910,116.310)` → `(39.909,116.311)` | 一端在线上未穿越，忽略 |
+| 位移不足 | 南→北跨门线但位移 `< min_displacement_m` | 忽略 |
+| 正向横穿 | `(39.909,116.310)` → `(39.911,116.310)` | **forward，时刻插值在中点** |
+| 反向横穿 | `(39.911,116.310)` → `(39.909,116.310)` | **reverse，时刻插值在中点** |
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -157,6 +238,10 @@ curl 'http://localhost:8000/fences/1/occupancy?start=2026-09-22T08:00:00Z&end=20
 | GET | `/fences/{id}/capacity-rules` | 容量规则列表（按生效时刻升序） |
 | DELETE | `/fences/{id}/capacity-rules/{rule_id}` | 删除容量规则 |
 | GET | `/fences/{id}/occupancy` | 查询 `[start, end)` 占用分段与超限明细（必填 start/end） |
+| POST | `/fences/{id}/gates` | 新增定向门线（围栏内简单 LineString + 正/反向名称 + 最小位移） |
+| GET | `/fences/{id}/gates` | 门线列表（按 id 升序） |
+| DELETE | `/fences/{id}/gates/{gate_id}` | 删除门线及其穿越记录 |
+| GET | `/crossings` | 门线穿越查询（device_id / gate_id / fence_id / direction / start / end，半开窗口） |
 | GET | `/health` | 健康检查 |
 
 ## 围栏配置参数
@@ -186,16 +271,17 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）与容量占用分段计算
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越）
 Dockerfile / docker-compose.yml
 ```
 
 ## 说明与取舍
 
-- 事件按设备全量轨迹重算并整体替换，保证乱序/重复提交下结果一致；事件 `id` 可能随重算变化，请以 `(device_id, fence_id, type, ts)` 识别事件。
+- 事件按设备全量轨迹重算并整体替换，保证乱序/重复提交下结果一致；事件 `id` 可能随重算变化，请以 `(device_id, fence_id, type, ts)` 识别事件。门线穿越同理整体重算，请以 `(device_id, gate_id, direction, ts)` 识别。
 - 同一设备同一时间戳的轨迹点视为重复（保留首条）。
 - 距离计算采用以围栏质心为原点的局部等距圆柱投影近似，围栏尺度（公里级）下误差可忽略。
+- 门线方向以**坐标书写顺序**为准（右→左为正向）；同一扇门反向画一遍会交换 forward/reverse 的语义，命名时请注意坐标顺序。

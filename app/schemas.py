@@ -99,3 +99,36 @@ class OccupancyOut(BaseModel):
     start: datetime
     end: datetime
     segments: list[OccupancySegmentOut]
+
+
+class GateLineCreate(BaseModel):
+    geometry: dict = Field(
+        description="GeoJSON LineString，至少两个不同坐标；整条线必须位于围栏有效区域内"
+    )
+    forward_name: str = Field(min_length=1, max_length=50, description="正向（右->左）名称")
+    reverse_name: str = Field(min_length=1, max_length=50, description="反向（左->右）名称")
+    min_displacement_m: float = Field(
+        0.0, ge=0, description="相邻轨迹点最小位移（米），不足则忽略该次穿越"
+    )
+
+
+class GateLineOut(BaseModel):
+    id: int
+    fence_id: int
+    geometry: dict
+    forward_name: str
+    reverse_name: str
+    min_displacement_m: float
+    created_at: datetime
+
+
+class CrossingOut(BaseModel):
+    id: int
+    device_id: str
+    fence_id: int
+    gate_id: int
+    direction: Literal["forward", "reverse"]
+    direction_name: str = Field(description="方向名称（取门线的正向/反向名称）")
+    ts: datetime = Field(description="按交点比例插值得到的穿越时刻")
+    lat: float = Field(description="交点纬度")
+    lon: float = Field(description="交点经度")

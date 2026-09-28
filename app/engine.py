@@ -6,6 +6,10 @@
 
 另含容量核算：由 enter/leave 事件还原设备半开在场区间，结合容量规则
 把查询窗口切分为状态恒定的占用分段并标注超限明细。
+
+门线穿越核算：在围栏有效区域内定义定向 GeoJSON LineString 门线，按设备
+时间重排轨迹，只承认线段对门线的单点横穿（proper crossing），穿越时刻按
+交点在线段上的时间比例插值。
 """
 from __future__ import annotations
 
@@ -19,6 +23,12 @@ EARTH_RADIUS_M = 6_371_000.0
 EVENT_ENTER = "enter"
 EVENT_LEAVE = "leave"
 EVENT_STAY = "stay"
+
+DIRECTION_FORWARD = "forward"    # 由门线右侧穿到左侧（沿门线坐标顺序看）
+DIRECTION_REVERSE = "reverse"    # 由门线左侧穿到右侧
+
+# 交点参数严格位于 (0, 1) 内的容差（米制投影坐标下）
+_CROSS_EPS = 1e-9
 
 
 def _project(lat: float, lon: float, lat0: float, lon0: float) -> tuple[float, float]:
@@ -51,6 +61,20 @@ class FenceEvent:
     ts: float   # 事件发生的轨迹时间（非确认时间）
 
 
+def _unproject(x: float, y: float, lat0: float, lon0: float) -> tuple[float, float]:
+    """局部米制坐标 -> 经纬度，_project 的逆变换。"""
+    lat = lat0 + math.degrees(y / EARTH_RADIUS_M)
+    lon = lon0 + math.degrees(x / (EARTH_RADIUS_M * math.cos(math.radians(lat0))))
+    return (lat, lon)
+
+
+def project_points(
+    coords: list[tuple[float, float]], lat0: float, lon0: float
+) -> list[tuple[float, float]]:
+    """把 (lon, lat) 坐标序列投影到以 (lat0, lon0) 为原点的局部米制坐标。"""
+    return [_project(lat, lon, lat0, lon0) for lon, lat in coords]
+
+
 class ProjectedFence:
     """投影到局部米制坐标系的围栏多边形，支持带孔多边形。"""
 
@@ -66,6 +90,11 @@ class ProjectedFence:
             for ring in polygon.interiors
         ]
         self._poly = Polygon(shell, holes)
+
+    @property
+    def origin(self) -> tuple[float, float]:
+        """投影原点 (lat0, lon0)。"""
+        return (self._lat0, self._lon0)
 
     def classify(self, lat: float, lon: float, prev_inside: bool) -> bool:
         """判定点是否在围栏内。
@@ -219,3 +248,127 @@ def compute_occupancy_segments(
         else:
             segments.append(OccupancySegment(a, b, devices, limit))
     return segments
+
+
+# ---------- 门线穿越核算 ----------
+
+
+@dataclass
+class GateLine:
+    """定向门线（已投影到所属围栏的局部米制坐标系）。
+
+    coords 为 LineString 折点序列；方向按坐标顺序判定：
+    沿坐标顺序看，由右侧穿到左侧为正向（forward），反之为反向（reverse）。
+    """
+
+    gate_id: int
+    coords: list[tuple[float, float]]
+    forward_name: str
+    reverse_name: str
+    min_displacement_m: float
+
+    def crossing(
+        self, a: tuple[float, float], b: tuple[float, float]
+    ) -> tuple[float, str, tuple[float, float]] | None:
+        """求轨迹线段 a->b 对门线的单点横穿。
+
+        返回 (交点在线段 a->b 上的比例 t, 方向, 交点米制坐标)；
+        不构成横穿时返回 None。以下情况一律忽略：
+        - 沿线（与某门线段共线/重合/重叠）；
+        - 仅接触门线端点或门线折点（交点不在两条线段的严格内部）；
+        - 两端在门线同一侧（同侧擦碰）；
+        - 同一轨迹线段与门线产生多于一个交点（门线仅 simple，理论上不出现，防御处理）。
+        """
+        hits: list[tuple[float, str, tuple[float, float]]] = []
+        for p, q in zip(self.coords, self.coords[1:]):
+            hit = _segment_proper_crossing(p, q, a, b)
+            if hit is not None:
+                hits.append(hit)
+        if len(hits) != 1:
+            return None
+        return hits[0]
+
+
+def _segment_proper_crossing(
+    p: tuple[float, float],
+    q: tuple[float, float],
+    a: tuple[float, float],
+    b: tuple[float, float],
+) -> tuple[float, str, tuple[float, float]] | None:
+    """两线段的严格内部单点横穿（proper crossing）。
+
+    门线段 p->q，轨迹线段 a->b。交点必须严格位于两条线段内部
+    （即参数 u、t 都在 (0, 1)），因此共线、接触端点/折点都被排除。
+    """
+    rx, ry = q[0] - p[0], q[1] - p[1]
+    sx, sy = b[0] - a[0], b[1] - a[1]
+    denom = rx * sy - ry * sx
+    if denom == 0.0:
+        return None  # 平行或共线（沿线）
+    qpx, qpy = a[0] - p[0], a[1] - p[1]
+    u = (qpx * sy - qpy * sx) / denom
+    t = (qpx * ry - qpy * rx) / denom
+    if not (_CROSS_EPS < u < 1.0 - _CROSS_EPS and _CROSS_EPS < t < 1.0 - _CROSS_EPS):
+        return None  # 交于端点/延长线（仅接触端点）或不相交
+
+    # 两端相对定向门线 p->q 的侧别（标准右手系）：
+    # cross(d, r) > 0 在门线右侧，< 0 在门线左侧。
+    side_a = qpx * ry - qpy * rx          # cross(A - P, r)
+    side_b = (qpx + sx) * ry - (qpy + sy) * rx
+    if side_a * side_b >= 0.0:
+        return None  # 两端同侧（同侧擦碰）或端点恰在门线上
+    point = (a[0] + t * sx, a[1] + t * sy)
+
+    # 沿门线坐标顺序看：右 -> 左为正向，左 -> 右为反向
+    direction = DIRECTION_FORWARD if side_a > 0 else DIRECTION_REVERSE
+    return (t, direction, point)
+
+
+@dataclass
+class GateCrossing:
+    gate_id: int
+    direction: str   # forward | reverse
+    ts: float        # 按交点在轨迹线段上的比例插值得到的穿越时刻
+    lat: float
+    lon: float
+
+
+def compute_crossings(
+    gates: list[GateLine],
+    points: list[TrackPoint],
+    lat0: float,
+    lon0: float,
+) -> list[GateCrossing]:
+    """对单个设备在某围栏内的门线集合计算穿越记录。
+
+    points 必须已按 ts 升序排列。对每对相邻点形成的轨迹线段逐一检测：
+    - 与门线单点横穿、两端分居两侧才承认（GateLine.crossing 内判定）；
+    - 相邻点位移不足门线 min_displacement_m 时忽略；
+    - 穿越时刻按交点在线段上的比例在两端点时间戳间线性插值。
+    同一轨迹段命中多条门线时，结果按 (插值时刻, gate_id) 排序。
+    """
+    crossings: list[GateCrossing] = []
+    for prev, cur in zip(points, points[1:]):
+        ax, ay = _project(prev.lat, prev.lon, lat0, lon0)
+        bx, by = _project(cur.lat, cur.lon, lat0, lon0)
+        dx, dy = bx - ax, by - ay
+        segment_len = math.hypot(dx, dy)
+        dt = cur.ts - prev.ts
+        a, b = (ax, ay), (bx, by)
+        for gate in gates:
+            if segment_len < gate.min_displacement_m:
+                continue  # 位移不足
+            hit = gate.crossing(a, b)
+            if hit is None:
+                continue
+            t, direction, (ix, iy) = hit
+            ilat, ilon = _unproject(ix, iy, lat0, lon0)
+            crossings.append(GateCrossing(
+                gate_id=gate.gate_id,
+                direction=direction,
+                ts=prev.ts + t * dt,
+                lat=ilat,
+                lon=ilon,
+            ))
+    crossings.sort(key=lambda c: (c.ts, c.gate_id))
+    return crossings
