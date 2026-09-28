@@ -61,3 +61,26 @@ class CapacityRule(Base):
     effective_from: Mapped[float] = mapped_column(Float)  # epoch 秒，规则生效时刻（含）
     max_occupancy: Mapped[int] = mapped_column(Integer)   # 容量上限，正整数
     created_at: Mapped[float] = mapped_column(Float)
+
+
+class Gate(Base):
+    __tablename__ = "gates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    geometry: Mapped[str] = mapped_column(Text)          # GeoJSON LineString
+    forward_name: Mapped[str] = mapped_column(String(100))  # 右 -> 左 方向名称
+    reverse_name: Mapped[str] = mapped_column(String(100))  # 左 -> 右 方向名称
+    min_displacement_m: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class Crossing(Base):
+    __tablename__ = "crossings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    device_id: Mapped[str] = mapped_column(String(100), index=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    gate_id: Mapped[int] = mapped_column(Integer, index=True)
+    direction: Mapped[str] = mapped_column(String(10))  # positive | negative
+    ts: Mapped[float] = mapped_column(Float, index=True)  # 交点插值时刻（epoch 秒）

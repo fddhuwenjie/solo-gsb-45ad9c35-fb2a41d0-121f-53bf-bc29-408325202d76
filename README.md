@@ -7,6 +7,7 @@
 - 边界抖动去抖：可配置的**进入/离开缓冲距离**（迟滞带）+ **停留时长**（dwell）
 - 产出 `enter` / `leave` / `stay` 事件；**重复提交轨迹点不会重复产出事件**（幂等）
 - **围栏容量核算**：按生效时刻维护正整数容量上限规则，查询任意 `[start, end)` 窗口的占用分段与超限明细
+- **门线定向穿越核算**：围栏内保存简单 GeoJSON LineString 门线，严格横穿才产出 `crossing`，方向按门线坐标顺序判定、时刻按交点比例插值
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -143,6 +144,81 @@ curl 'http://localhost:8000/fences/1/occupancy?start=2026-09-22T08:00:00Z&end=20
 4. **超限明细**：`exceeded=true` 的分段给出 `limit`（上限）、`count`（实际人数）、`excess`（超额数）与按 ID 排序的 `devices`；其余分段 `excess`/`devices` 为 `null`。
 5. **重算一致**：占用在查询时由事件现算；补录乱序轨迹点触发事件重算后，再次查询即反映最新结果，不残留旧的占用或超限片段。
 
+## 门线定向穿越核算
+
+### 1. 新增门线
+
+```bash
+curl -X POST http://localhost:8000/fences/1/gates \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "geometry": {
+      "type": "LineString",
+      "coordinates": [[116.310, 39.902], [116.310, 39.918]]
+    },
+    "forward_name": "东向西进入",
+    "reverse_name": "西向东离开",
+    "min_displacement_m": 5
+  }'
+```
+
+- `geometry`：**简单 GeoJSON LineString**（至少 2 点、不闭合、不自交）。整条线必须位于围栏**有效区域**内——不得越出外环，也不得进入或穿过任何孔洞（贴外环允许），否则 `422`。
+- `forward_name` / `reverse_name`：正/反两个方向的名称；`min_displacement_m`：产生穿越所需的最小轨迹段位移（米，默认 0）。
+- 围栏不存在返回 `404`；新建门线会立即对全部已有设备轨迹重算穿越。
+- 管理接口：`GET /fences/1/gates`（按 ID 升序）、`DELETE /fences/1/gates/{gate_id}`（同时删除其穿越记录）。
+
+### 2. 穿越判定规则
+
+相邻轨迹点（按设备时间重排后）组成的线段与门线做几何判定，**只有“单点严格横穿、两端分居两侧”才产生一条 crossing**：
+
+| 情形 | 是否产出 crossing |
+| --- | --- |
+| 横穿门线内部，交点在轨迹段与门线两侧 | ✅ 产出，时刻按交点在轨迹段上的比例插值 |
+| 沿门线行走 / 与门线共线重叠 | ❌ 忽略 |
+| 仅接触门线的首/尾端点 | ❌ 忽略 |
+| 门线折点处两侧邻点同侧（擦碰） | ❌ 忽略；分居两侧才按折点横穿计 |
+| 单个轨迹段横穿同一门线两次以上（如跨过 Z 形门线） | ❌ 整段忽略 |
+| 轨迹段投影长度 < `min_displacement_m` | ❌ 位移不足，忽略 |
+
+- **方向**：按门线坐标顺序判定。沿线坐标顺序行进时左侧为正侧：轨迹**从右侧穿到左侧**为 `positive`（取 `forward_name`），**从左侧穿到右侧**为 `negative`（取 `reverse_name`）。
+- **时刻**：交点位于轨迹段 `p0→p1` 的参数 `t∈(0,1)`，穿越时刻 = `t0 + t·(t1 - t0)`。
+- 同一轨迹段命中多条门线时，结果按 **(插值时刻, 门线 ID)** 排序。
+- 与围栏事件一致：轨迹点按 `(device_id, ts)` 去重，每次摄入按设备全量重算，**补录乱序点后穿越结果自动重算，重复提交不产生重复 crossing**。
+
+### 3. 查询穿越记录
+
+```bash
+curl 'http://localhost:8000/crossings?device_id=dev-001&gate_id=1&direction=positive&start=2026-09-22T08:00:00Z&end=2026-09-22T09:00:00Z'
+```
+
+返回示例（时间窗口为半开 `[start, end)`；`direction_name` 取自门线当前配置的方向名称）：
+
+```json
+[
+  {
+    "id": 12,
+    "device_id": "dev-001",
+    "fence_id": 1,
+    "gate_id": 1,
+    "direction": "positive",
+    "direction_name": "东向西进入",
+    "ts": "2026-09-22T08:12:34.500000Z"
+  }
+]
+```
+
+可选过滤参数：`device_id`、`fence_id`、`gate_id`、`direction`（`positive`/`negative`）、`start`、`end`（半开）、`limit`、`offset`；默认按 `(ts, gate_id)` 升序。`start >= end` 返回 `422`。
+
+### 4. 边界示例（坐标为 `[lon, lat]`）
+
+以南北走向门线 `[[0.005,0.002],[0.005,0.008]]`（沿 lon=0.005 自南向北；右=东、左=西）为例：
+
+- 轨迹 `(lat 0.005, lon 0.008)@t0 → (lat 0.005, lon 0.002)@t0+10s`：东→西横穿，`positive`，交点在中点，时刻 `t0+5s`。
+- 轨迹终点恰好落在门线端点 `(0.005, 0.002)`：仅接触端点，**无** crossing。
+- 轨迹点 `(lat 0.003→0.007, lon 恒为 0.005)`：与门线共线（沿线），**无** crossing。
+- 轨迹段两端都在门线东侧（如 lon 恒为 0.006）：同侧，**无** crossing。
+- 单段 `(lat 0.002, lon 0.005) → (lat 0.008, lon 0.005)` 穿过 Z 形折线门线多个子段：交点不止一个，**整段忽略**。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -157,6 +233,10 @@ curl 'http://localhost:8000/fences/1/occupancy?start=2026-09-22T08:00:00Z&end=20
 | GET | `/fences/{id}/capacity-rules` | 容量规则列表（按生效时刻升序） |
 | DELETE | `/fences/{id}/capacity-rules/{rule_id}` | 删除容量规则 |
 | GET | `/fences/{id}/occupancy` | 查询 `[start, end)` 占用分段与超限明细（必填 start/end） |
+| POST | `/fences/{id}/gates` | 新增门线（简单 LineString，须完全在围栏有效区域内 + 正反方向名 + 最小位移） |
+| GET | `/fences/{id}/gates` | 门线列表（按 ID 升序） |
+| DELETE | `/fences/{id}/gates/{gate_id}` | 删除门线及其穿越记录 |
+| GET | `/crossings` | 门线穿越查询（device_id / fence_id / gate_id / direction / `[start,end)` / limit / offset） |
 | GET | `/health` | 健康检查 |
 
 ## 围栏配置参数
@@ -186,16 +266,16 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）与容量占用分段计算
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机、容量占用分段、门线严格横穿判定
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gates / crossings）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越）
 Dockerfile / docker-compose.yml
 ```
 
 ## 说明与取舍
 
-- 事件按设备全量轨迹重算并整体替换，保证乱序/重复提交下结果一致；事件 `id` 可能随重算变化，请以 `(device_id, fence_id, type, ts)` 识别事件。
+- 事件与门线穿越均按设备全量轨迹重算并整体替换，保证乱序/重复提交下结果一致；记录 `id` 可能随重算变化，请以业务字段组合识别。
 - 同一设备同一时间戳的轨迹点视为重复（保留首条）。
 - 距离计算采用以围栏质心为原点的局部等距圆柱投影近似，围栏尺度（公里级）下误差可忽略。

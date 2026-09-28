@@ -11,24 +11,32 @@ from sqlalchemy.orm import Session
 
 from .database import engine, get_db
 from .engine import (
+    DIRECTION_NEGATIVE,
+    DIRECTION_POSITIVE,
     EVENT_ENTER,
     EVENT_LEAVE,
     FenceConfig,
+    GateSpec,
     ProjectedFence,
     TrackPoint,
+    compute_crossings,
     compute_events,
     compute_occupancy_segments,
+    validate_gate_line,
 )
-from .models import Base, CapacityRule, DeviceState, Event, Fence, TrackPointRow
+from .models import Base, CapacityRule, Crossing, DeviceState, Event, Fence, Gate, TrackPointRow
 from .schemas import (
     CapacityRuleCreate,
     CapacityRuleOut,
+    CrossingOut,
     DeviceStatusOut,
     EventOut,
     FenceConfigSchema,
     FenceCreate,
     FenceOut,
     FenceStateOut,
+    GateCreate,
+    GateOut,
     IngestResult,
     OccupancyOut,
     OccupancySegmentOut,
@@ -59,8 +67,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="轨迹围栏事件 API",
-    description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，支持围栏容量核算",
-    version="1.1.0",
+    description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
+                "支持围栏容量核算与门线（Gate）定向穿越核算",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -84,6 +93,7 @@ def recompute_device(db: Session, device_id: str) -> None:
 
     db.query(Event).filter_by(device_id=device_id).delete()
     db.query(DeviceState).filter_by(device_id=device_id).delete()
+    db.query(Crossing).filter_by(device_id=device_id).delete()
 
     for f in fences:
         polygon = shape(json.loads(f.geometry))
@@ -104,6 +114,26 @@ def recompute_device(db: Session, device_id: str) -> None:
             state="inside" if inside else "outside",
             since=since,
         ))
+
+        gate_rows = db.query(Gate).filter_by(fence_id=f.id).order_by(Gate.id).all()
+        gates = [
+            GateSpec(
+                gate_id=g.id,
+                line=shape(json.loads(g.geometry)),
+                forward_name=g.forward_name,
+                reverse_name=g.reverse_name,
+                min_displacement_m=g.min_displacement_m,
+            )
+            for g in gate_rows
+        ]
+        for c in compute_crossings(pf, points, gates):
+            db.add(Crossing(
+                device_id=device_id,
+                fence_id=f.id,
+                gate_id=c.gate_id,
+                direction=c.direction,
+                ts=c.ts,
+            ))
     db.commit()
 
 
@@ -178,10 +208,92 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
     fence = db.get(Fence, fence_id)
     if fence is None:
         raise HTTPException(status_code=404, detail="围栏不存在")
+    gate_ids = [r[0] for r in db.query(Gate.id).filter_by(fence_id=fence_id).all()]
+    if gate_ids:
+        db.query(Crossing).filter(Crossing.gate_id.in_(gate_ids)).delete(
+            synchronize_session=False
+        )
+    db.query(Gate).filter_by(fence_id=fence_id).delete()
     db.query(Event).filter_by(fence_id=fence_id).delete()
     db.query(DeviceState).filter_by(fence_id=fence_id).delete()
     db.query(CapacityRule).filter_by(fence_id=fence_id).delete()
     db.delete(fence)
+    db.commit()
+
+
+# ---------- 门线管理 ----------
+
+def gate_out(g: Gate) -> GateOut:
+    return GateOut(
+        id=g.id,
+        fence_id=g.fence_id,
+        geometry=json.loads(g.geometry),
+        forward_name=g.forward_name,
+        reverse_name=g.reverse_name,
+        min_displacement_m=g.min_displacement_m,
+        created_at=to_iso(g.created_at),
+    )
+
+
+@app.post("/fences/{fence_id}/gates", response_model=GateOut, status_code=201)
+def create_gate(fence_id: int, body: GateCreate, db: Session = Depends(get_db)):
+    """在指定围栏内新增门线。
+
+    geometry 必须是简单 GeoJSON LineString（≥2 点、不闭合、不自交），
+    且整条线位于围栏有效区域内（不得越出外环或穿过孔洞，否则 422）。
+    新增后对全部已有设备轨迹重算该门线的穿越记录。
+    """
+    fence = db.get(Fence, fence_id)
+    if fence is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    try:
+        geom = shape(body.geometry)
+    except Exception:
+        raise HTTPException(status_code=422, detail="geometry 不是合法的 GeoJSON")
+
+    polygon = shape(json.loads(fence.geometry))
+    err = validate_gate_line(polygon, geom)
+    if err is not None:
+        raise HTTPException(status_code=422, detail=err)
+
+    gate = Gate(
+        fence_id=fence_id,
+        geometry=json.dumps(body.geometry),
+        forward_name=body.forward_name,
+        reverse_name=body.reverse_name,
+        min_displacement_m=body.min_displacement_m,
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(gate)
+    db.commit()
+    db.refresh(gate)
+
+    # 新门线对存量设备轨迹生效
+    with INGEST_LOCK:
+        device_ids = [r[0] for r in db.query(TrackPointRow.device_id).distinct()]
+        for device_id in device_ids:
+            recompute_device(db, device_id)
+
+    return gate_out(gate)
+
+
+@app.get("/fences/{fence_id}/gates", response_model=list[GateOut])
+def list_gates(fence_id: int, db: Session = Depends(get_db)):
+    """列出门线（按 ID 升序）。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    gates = db.query(Gate).filter_by(fence_id=fence_id).order_by(Gate.id).all()
+    return [gate_out(g) for g in gates]
+
+
+@app.delete("/fences/{fence_id}/gates/{gate_id}", status_code=204)
+def delete_gate(fence_id: int, gate_id: int, db: Session = Depends(get_db)):
+    """删除门线及其全部穿越记录。"""
+    gate = db.get(Gate, gate_id)
+    if gate is None or gate.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="门线不存在")
+    db.query(Crossing).filter_by(gate_id=gate_id).delete()
+    db.delete(gate)
     db.commit()
 
 
@@ -252,6 +364,58 @@ def list_events(
         EventOut(id=e.id, device_id=e.device_id, fence_id=e.fence_id, type=e.type, ts=to_iso(e.ts))
         for e in rows
     ]
+
+
+@app.get("/crossings", response_model=list[CrossingOut])
+def list_crossings(
+    device_id: str | None = None,
+    gate_id: int | None = None,
+    fence_id: int | None = None,
+    direction: Literal["positive", "negative"] | None = None,
+    start: datetime | None = Query(None, description="起始时间（ISO 8601，含）"),
+    end: datetime | None = Query(None, description="结束时间（ISO 8601，不含）"),
+    limit: int = Query(1000, le=10000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """查询门线穿越记录，按 (插值时刻, 门线 ID) 升序返回。
+
+    可按设备、围栏、门线、方向与 [start, end) 半开时间窗口过滤。
+    方向名称取自门线当前配置（正向=右->左、反向=左->右）。
+    """
+    q = db.query(Crossing)
+    if device_id is not None:
+        q = q.filter(Crossing.device_id == device_id)
+    if gate_id is not None:
+        q = q.filter(Crossing.gate_id == gate_id)
+    if fence_id is not None:
+        q = q.filter(Crossing.fence_id == fence_id)
+    if direction is not None:
+        q = q.filter(Crossing.direction == direction)
+    start_ts = to_epoch(start) if start is not None else None
+    end_ts = to_epoch(end) if end is not None else None
+    if start_ts is not None and end_ts is not None and start_ts >= end_ts:
+        raise HTTPException(status_code=422, detail="start 必须早于 end")
+    if start_ts is not None:
+        q = q.filter(Crossing.ts >= start_ts)
+    if end_ts is not None:
+        q = q.filter(Crossing.ts < end_ts)  # 半开 [start, end)
+    rows = q.order_by(Crossing.ts, Crossing.gate_id, Crossing.id).limit(limit).offset(offset).all()
+
+    gate_names = {g.id: (g.forward_name, g.reverse_name) for g in db.query(Gate).all()}
+    result: list[CrossingOut] = []
+    for c in rows:
+        forward_name, reverse_name = gate_names.get(c.gate_id, ("positive", "negative"))
+        result.append(CrossingOut(
+            id=c.id,
+            device_id=c.device_id,
+            fence_id=c.fence_id,
+            gate_id=c.gate_id,
+            direction=c.direction,
+            direction_name=forward_name if c.direction == DIRECTION_POSITIVE else reverse_name,
+            ts=to_iso(c.ts),
+        ))
+    return result
 
 
 @app.get("/devices/{device_id}/status", response_model=DeviceStatusOut)
